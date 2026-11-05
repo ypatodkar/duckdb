@@ -613,6 +613,8 @@ private:
 	unique_ptr<LogicalOperator> CreatePlan(BoundQueryNode &node);
 
 	void BuildUnionByNameInfo(BoundSetOperationNode &result);
+	void NestUnionOnTypeChange(SetOperationNode &statement, BoundSetOperationNode &result);
+	BoundStatement BindSetOperation(SetOperationNode &statement, BoundSetOperationNode &result);
 
 	BoundStatement BindJoin(Binder &parent, TableRef &ref);
 	BoundStatement Bind(BaseTableRef &ref);

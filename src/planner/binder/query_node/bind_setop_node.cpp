@@ -339,7 +339,115 @@ BoundStatement Binder::BindNode(SetOperationNode &statement) {
 		result.bound_children.push_back(std::move(child_node));
 		result.child_binders.push_back(std::move(child_binder));
 	}
+	NestUnionOnTypeChange(statement, result);
+	return BindSetOperation(statement, result);
+}
 
+// whether casting to the narrower type first gives the same values, and the same duplicates, as casting directly
+static bool WideningKeepsValues(const LogicalType &narrow, const LogicalType &wide) {
+	if (narrow == wide || narrow.id() == LogicalTypeId::SQLNULL || (narrow.IsIntegral() && wide.IsIntegral())) {
+		return true;
+	}
+	if (narrow.id() != wide.id()) {
+		return false;
+	}
+	switch (narrow.id()) {
+	case LogicalTypeId::LIST:
+		return WideningKeepsValues(ListType::GetChildType(narrow), ListType::GetChildType(wide));
+	case LogicalTypeId::STRUCT: {
+		// structs are cast by name, so new fields are NULL for the narrower values
+		if (StructType::IsUnnamed(narrow) || StructType::IsUnnamed(wide)) {
+			return false;
+		}
+		auto &wide_children = StructType::GetChildTypes(wide);
+		identifier_map_t<idx_t> wide_index;
+		for (idx_t i = 0; i < wide_children.size(); i++) {
+			wide_index.emplace(wide_children[i].first, i);
+		}
+		for (auto &narrow_child : StructType::GetChildTypes(narrow)) {
+			auto entry = wide_index.find(narrow_child.first);
+			if (entry == wide_index.end() ||
+			    !WideningKeepsValues(narrow_child.second, wide_children[entry->second].second)) {
+				return false;
+			}
+		}
+		return true;
+	}
+	default:
+		return false;
+	}
+}
+
+// a flattened "A UNION B UNION C" means "(A UNION B) UNION C": when the type widens in a way that can change values
+// after the first two children, the children before it are nested so they are cast and deduplicated at their type
+void Binder::NestUnionOnTypeChange(SetOperationNode &statement, BoundSetOperationNode &result) {
+	auto by_name = result.setop_type == SetOperationType::UNION_BY_NAME;
+	if (result.setop_type != SetOperationType::UNION && !by_name) {
+		return;
+	}
+	auto &children = result.bound_children;
+	for (auto &child : children) {
+		if (!by_name && child.types.size() != children[0].types.size()) {
+			// reported when binding the set operation
+			return;
+		}
+	}
+	// widens the current type, returns whether that can change the values of the children so far
+	auto widen = [&](LogicalType &current, const LogicalType &type) {
+		auto max_type = LogicalType::ForceMaxLogicalType(context, current, type);
+		auto changes_values = !WideningKeepsValues(current, max_type);
+		current = std::move(max_type);
+		return changes_values;
+	};
+	vector<LogicalType> position_types;
+	identifier_map_t<LogicalType> name_types;
+	vector<BoundStatement> nested_children;
+	vector<shared_ptr<Binder>> nested_binders;
+	for (idx_t child_idx = 0; child_idx < children.size(); child_idx++) {
+		auto &child = children[child_idx];
+		bool changes_values = false;
+		if (by_name) {
+			for (idx_t col_idx = 0; col_idx < child.names.size(); col_idx++) {
+				auto entry = name_types.find(child.names[col_idx]);
+				if (entry == name_types.end()) {
+					name_types.emplace(child.names[col_idx], child.types[col_idx]);
+				} else {
+					changes_values = widen(entry->second, child.types[col_idx]) || changes_values;
+				}
+			}
+		} else if (child_idx == 0) {
+			position_types = child.types;
+		} else {
+			for (idx_t col_idx = 0; col_idx < child.types.size(); col_idx++) {
+				changes_values = widen(position_types[col_idx], child.types[col_idx]) || changes_values;
+			}
+		}
+		if (changes_values && nested_children.size() >= 2) {
+			auto prefix_binder = Binder::CreateBinder(context, this);
+			prefix_binder->SetCanContainNulls(true);
+			SetOperationNode prefix_statement;
+			prefix_statement.setop_type = statement.setop_type;
+			prefix_statement.setop_all = statement.setop_all;
+			BoundSetOperationNode prefix;
+			prefix.setop_type = result.setop_type;
+			prefix.setop_all = result.setop_all;
+			prefix.setop_index = prefix_binder->GenerateTableIndex();
+			prefix.bound_children = std::move(nested_children);
+			prefix.child_binders = std::move(nested_binders);
+			auto bound_prefix = prefix_binder->BindSetOperation(prefix_statement, prefix);
+			nested_children.clear();
+			nested_binders.clear();
+			nested_children.push_back(std::move(bound_prefix));
+			nested_binders.push_back(std::move(prefix_binder));
+		}
+		nested_children.push_back(std::move(child));
+		nested_binders.push_back(std::move(result.child_binders[child_idx]));
+	}
+	result.bound_children = std::move(nested_children);
+	result.child_binders = std::move(nested_binders);
+}
+
+BoundStatement Binder::BindSetOperation(SetOperationNode &statement, BoundSetOperationNode &result) {
 	if (result.setop_type == SetOperationType::UNION_BY_NAME) {
 		// UNION BY NAME - merge the columns from all sides
 		BuildUnionByNameInfo(result);

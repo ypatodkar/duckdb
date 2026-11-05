@@ -1,0 +1,202 @@
+# name: test/sql/setops/test_union_chain_widening.test
+# description: A UNION chain casts and deduplicates the children before a type change at their own type
+# group: [setops]
+
+statement ok
+CREATE TABLE online_orders (amount DOUBLE);
+
+statement ok
+INSERT INTO online_orders VALUES (1.5), (2.0);
+
+statement ok
+CREATE TABLE store_orders (amount INTEGER);
+
+statement ok
+INSERT INTO store_orders VALUES (2), (87);
+
+statement ok
+CREATE TABLE notes (amount VARCHAR);
+
+statement ok
+INSERT INTO notes VALUES ('unknown');
+
+query T rowsort
+(SELECT 1.5::DOUBLE AS x UNION SELECT 87::INTEGER) UNION SELECT 'text'::VARCHAR
+----
+1.5
+87.0
+text
+
+query T rowsort
+(SELECT 1.5::DOUBLE AS x UNION SELECT 87::INTEGER) UNION ALL SELECT 'text'::VARCHAR
+----
+1.5
+87.0
+text
+
+query T rowsort
+SELECT x FROM (SELECT 1.5::DOUBLE AS x UNION SELECT 87::INTEGER) q UNION SELECT 'text'::VARCHAR
+----
+1.5
+87.0
+text
+
+query T rowsort
+SELECT 1.5::DOUBLE AS x UNION SELECT 87::INTEGER UNION SELECT 'text'
+----
+1.5
+87.0
+text
+
+query T rowsort
+SELECT 'text' AS x UNION (SELECT 1.5::DOUBLE UNION SELECT 87::INTEGER)
+----
+1.5
+87.0
+text
+
+query T rowsort
+SELECT 1.5::DOUBLE AS x UNION ALL SELECT 87::INTEGER UNION ALL SELECT 'text'
+----
+1.5
+87.0
+text
+
+query T rowsort
+(SELECT 1.5::DOUBLE AS x UNION ALL SELECT 87::INTEGER) UNION ALL SELECT 'text'
+----
+1.5
+87.0
+text
+
+# values that are equal at the narrower type are deduplicated before the cast
+query T rowsort
+(SELECT amount FROM online_orders UNION SELECT amount FROM store_orders) UNION SELECT amount FROM notes
+----
+1.5
+2.0
+87.0
+unknown
+
+query T rowsort
+SELECT amount FROM online_orders UNION ALL SELECT amount FROM store_orders UNION ALL SELECT amount FROM notes
+----
+1.5
+2.0
+2.0
+87.0
+unknown
+
+query I
+SELECT count(*) FROM (
+	(SELECT INTERVAL '1 month' AS x UNION SELECT INTERVAL '30 days') UNION SELECT 'ask sales'
+)
+----
+2
+
+query T rowsort
+SELECT 1.5 AS x UNION SELECT 1.25 UNION SELECT 'x'
+----
+1.25
+1.50
+x
+
+# the type widens twice: INTEGER, then DOUBLE, then VARCHAR
+query T rowsort
+SELECT 1::INTEGER AS x UNION SELECT 2::INTEGER UNION SELECT 1.5::DOUBLE UNION SELECT 2.0::DOUBLE UNION SELECT 'x'
+----
+1.0
+1.5
+2.0
+x
+
+query IT rowsort
+(SELECT 1.5::DOUBLE AS a, 'p' AS b UNION SELECT 87::INTEGER, 'q') UNION SELECT 'text', 'r'
+----
+1.5	p
+87.0	q
+text	r
+
+query T
+(SELECT amount FROM online_orders UNION SELECT amount FROM store_orders) UNION SELECT amount FROM notes
+ORDER BY amount DESC LIMIT 2
+----
+unknown
+87.0
+
+query T
+SELECT (SELECT t.i::DOUBLE UNION SELECT 2::INTEGER UNION SELECT 'x' ORDER BY 1 LIMIT 1 OFFSET 1) FROM (VALUES (1)) t(i)
+----
+2.0
+
+statement ok
+CREATE VIEW all_amounts AS
+(SELECT amount FROM online_orders UNION SELECT amount FROM store_orders) UNION SELECT amount FROM notes
+
+query T rowsort
+SELECT * FROM all_amounts
+----
+1.5
+2.0
+87.0
+unknown
+
+query T rowsort
+(SELECT 1.5::DOUBLE AS x UNION BY NAME SELECT 87::INTEGER AS x) UNION BY NAME SELECT 'text' AS x
+----
+1.5
+87.0
+text
+
+query T rowsort
+SELECT 1.5::DOUBLE AS x UNION ALL BY NAME SELECT 87::INTEGER AS x UNION ALL BY NAME SELECT 'text' AS x
+----
+1.5
+87.0
+text
+
+query TI rowsort
+(SELECT 2.0::DOUBLE AS x UNION BY NAME SELECT 2::INTEGER AS x) UNION BY NAME SELECT 1 AS y, 'x' AS x
+----
+2.0	NULL
+x	1
+
+# widening between integer types keeps the values
+query T rowsort
+SELECT 1::INTEGER AS x UNION SELECT 1::INTEGER UNION SELECT 2::BIGINT UNION SELECT 'x'
+----
+1
+2
+x
+
+# new struct fields are NULL for the earlier values
+query T rowsort
+SELECT s::VARCHAR FROM (SELECT {'a': 1} AS s UNION SELECT {'b': 2} UNION SELECT {'a': 1, 'b': NULL})
+----
+{'a': 1, 'b': NULL}
+{'a': NULL, 'b': 2}
+
+query T rowsort
+SELECT s.a FROM ((SELECT {'a': 1.5::DOUBLE} AS s UNION SELECT {'a': 87}) UNION SELECT {'a': 'text'})
+----
+1.5
+87.0
+text
+
+query T rowsort
+SELECT l[1] FROM ((SELECT [1.5::DOUBLE] AS l UNION SELECT [87]) UNION SELECT ['text'])
+----
+1.5
+87.0
+text
+
+query I rowsort
+SELECT NULL AS x UNION SELECT NULL UNION SELECT 1
+----
+1
+NULL
+
+statement error
+SELECT 1 AS x UNION SELECT 2 UNION SELECT 3, 4
+----
+<REGEX>:Binder Error:.*same number of result columns.*
